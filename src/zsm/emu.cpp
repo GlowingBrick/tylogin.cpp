@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -14,6 +15,19 @@
 namespace ty {
 bool gDebug = false;
 
+static void clockPrefix() {
+    time_t t = time(nullptr);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char b[32];
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(stderr, "[%s] ", b);
+}
+
 // hook entry points (defined below, used by the Emu ctor)
 void emuIntrHook(uc_engine* uc, uint64_t intno, void* user);
 void emuMemHook(uc_engine* uc, uc_mem_type type, uint64_t addr, int size, int64_t value,
@@ -21,6 +35,7 @@ void emuMemHook(uc_engine* uc, uc_mem_type type, uint64_t addr, int size, int64_
 
 void logRaw(const char* fmt, ...) {
     va_list ap;
+    clockPrefix();
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -30,6 +45,7 @@ void logRaw(const char* fmt, ...) {
 void logDbg(const char* fmt, ...) {
     if (!gDebug) return;
     va_list ap;
+    clockPrefix();
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);

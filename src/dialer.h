@@ -47,8 +47,9 @@ private:
     KeepOutcome keepOnce();
     KeepOutcome keepWithRetry();
     bool hasKeepSession() const;
-    bool quickPortalProbe();
-    bool sleepWithProbe(long totalSec);
+    enum class ProbeResult { OK, EARLY_KEEP, FORCE_RELOGIN };
+    ProbeResult quickPortalProbe();
+    ProbeResult sleepWithProbe(long totalSec);
     void term(const std::string& reason = "1");
     void resetSession();
     HttpResp post(const std::string& url, const std::string& body);

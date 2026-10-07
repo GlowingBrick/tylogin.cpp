@@ -28,8 +28,8 @@ static std::string clockStr() {
 #else
     localtime_r(&t, &tmv);
 #endif
-    char b[16];
-    strftime(b, sizeof(b), "%H:%M:%S", &tmv);
+    char b[32];
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
     return b;
 }
 
@@ -37,9 +37,11 @@ void dlog(const std::string& s) {
     if (g_debug) fprintf(stderr, "[%s] %s\n", clockStr().c_str(), s.c_str());
 }
 
-void info(const std::string& s) { printf("%s\n", s.c_str()); }
+void info(const std::string& s) { printf("[%s] %s\n", clockStr().c_str(), s.c_str()); }
 
-void err(const std::string& s) { fprintf(stderr, "错误: %s\n", s.c_str()); }
+void err(const std::string& s) {
+    fprintf(stderr, "[%s] 错误: %s\n", clockStr().c_str(), s.c_str());
+}
 
 std::string nowTime() {
     time_t t = time(nullptr);

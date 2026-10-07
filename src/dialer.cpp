@@ -37,6 +37,9 @@ static constexpr long KEEP_RETRY_DELAY_MS = 3000;
 static constexpr long PROBE_SLICE_SEC = 5;
 static constexpr long PROBE_EVERY_SEC = 15;
 static constexpr int PROBE_TIMEOUT_MS = 5000;
+// generate_204 保底：失败后每 3s 重试，连续 5 次失败则强制下线重登
+static constexpr int NET204_MAX_FAILS = 5;
+static constexpr long NET204_RETRY_DELAY_SEC = 3;
 static const char* kNet204Url = "http://connectivitycheck.gstatic.com/generate_204";
 // TY_PORTAL_BASE overrides detect/check URLs (mock-portal testing only)
 static std::string detectUrl() {
@@ -396,10 +399,28 @@ bool Dialer::hasKeepSession() const {
 }
 
 // Lightweight liveness probe between heartbeats (no crypto, 5s timeout):
-//  - CHECK_URL 302 with Location => BAS says unauthenticated (kicked/offline) => false
-//  - CHECK exception/timeout => link down => false
-//  - CHECK 200 (ONLINE) => true; internet 204 is best-effort only (logged, never aborts)
-bool Dialer::quickPortalProbe() {
+//  - CHECK_URL 302 with Location => BAS says unauthenticated (kicked/offline) => EARLY_KEEP
+//  - CHECK exception/timeout => link down => EARLY_KEEP
+//  - CHECK 200 (ONLINE) + generate_204 保底：204 成功 => OK；204 失败则每 3s 重试，
+//    中途成功即清零放行，连续 NET204_MAX_FAILS 次失败 => FORCE_RELOGIN（强制下线重登）
+static bool net204Once() {
+    try {
+        HttpRequest n;
+        n.url = kNet204Url;
+        n.headers = {{"User-Agent", kUA}};
+        n.connectTimeoutMs = PROBE_TIMEOUT_MS;
+        n.readTimeoutMs = PROBE_TIMEOUT_MS;
+        HttpResp net = httpOnce(n);
+        if (net.code == 204 || net.code == 200) return true;
+        dlog("204 probe: HTTP " + std::to_string(net.code));
+        return false;
+    } catch (const std::exception& e) {
+        dlog(std::string("204 probe failed: ") + e.what());
+        return false;
+    }
+}
+
+Dialer::ProbeResult Dialer::quickPortalProbe() {
     try {
         HttpRequest r;
         r.url = checkUrl();
@@ -410,42 +431,45 @@ bool Dialer::quickPortalProbe() {
         std::string loc = chk.header("Location");
         if (!loc.empty()) {
             dlog("probe: portal redirect reappeared -> " + loc.substr(0, 120));
-            return false;
+            return ProbeResult::EARLY_KEEP;
         }
-        try {
-            HttpRequest n;
-            n.url = kNet204Url;
-            n.headers = {{"User-Agent", kUA}};
-            n.connectTimeoutMs = PROBE_TIMEOUT_MS;
-            n.readTimeoutMs = PROBE_TIMEOUT_MS;
-            HttpResp net = httpOnce(n);
-            if (net.code != 204 && net.code != 200)
-                dlog("204 probe: HTTP " + std::to_string(net.code) +
-                     " (portal ONLINE, keep going)");
-        } catch (const std::exception& e) {
-            dlog(std::string("204 probe failed: ") + e.what() + " (portal ONLINE, keep going)");
+        for (int i = 1; i <= NET204_MAX_FAILS && !gStop; i++) {
+            if (net204Once()) {
+                if (i > 1) dlog("204 probe recovered on attempt " + std::to_string(i));
+                return ProbeResult::OK;
+            }
+            if (i < NET204_MAX_FAILS) {
+                dlog("204 probe failed (" + std::to_string(i) + "/" +
+                     std::to_string(NET204_MAX_FAILS) + "), retry in " +
+                     std::to_string(NET204_RETRY_DELAY_SEC) + "s");
+                sleepInterruptible(NET204_RETRY_DELAY_SEC);
+                if (gStop) return ProbeResult::OK;  // shutting down: let caller exit
+            }
         }
-        return true;
+        if (gStop) return ProbeResult::OK;
+        return ProbeResult::FORCE_RELOGIN;
     } catch (const std::exception& e) {
         dlog(std::string("probe failed: ") + e.what());
-        return false;
+        return ProbeResult::EARLY_KEEP;
     }
 }
 
-// sleep keepInterval in 5s slices; return false when probe suggests an early heartbeat/relogin
-bool Dialer::sleepWithProbe(long totalSec) {
+// sleep keepInterval in 5s slices; EARLY_KEEP = probe suggests an early heartbeat,
+// FORCE_RELOGIN = generate_204 保底连续失败，调用方直接下线重登
+Dialer::ProbeResult Dialer::sleepWithProbe(long totalSec) {
     long elapsed = 0;
     while (elapsed < totalSec && !gStop) {
         long step =
             PROBE_SLICE_SEC < totalSec - elapsed ? PROBE_SLICE_SEC : totalSec - elapsed;
         sleepInterruptible(step);
-        if (gStop) return true;  // shutting down: the caller's loop condition handles exit
+        if (gStop) return ProbeResult::OK;  // shutting down: caller's loop handles exit
         elapsed += step;
         if (elapsed < totalSec && elapsed % PROBE_EVERY_SEC == 0) {
-            if (!quickPortalProbe()) return false;
+            ProbeResult r = quickPortalProbe();
+            if (r != ProbeResult::OK) return r;
         }
     }
-    return true;
+    return ProbeResult::OK;
 }
 
 void Dialer::term(const std::string& reason) {
@@ -568,8 +592,13 @@ int Dialer::runLoop() {
             if (gStop) break;  // Ctrl+C: the final term() below logs out with the intact session
             switch (outcome.kind) {
                 case KeepOutcome::OK: {
-                    bool sleptFull = sleepWithProbe(keepInterval_);
-                    if (!sleptFull) info("探活异常，提前心跳…");
+                    ProbeResult pr = sleepWithProbe(keepInterval_);
+                    if (pr == ProbeResult::FORCE_RELOGIN) {
+                        info("外网探活连续失败（generate_204x" +
+                             std::to_string(NET204_MAX_FAILS) + "），下线重登…");
+                        break;  // fall through to term()+resetSession()+relogin below
+                    }
+                    if (pr == ProbeResult::EARLY_KEEP) info("探活异常，提前心跳…");
                     continue;
                 }
                 case KeepOutcome::PROTO_FAIL:
