@@ -338,6 +338,7 @@ const char* Dialer::auth(const std::string& user, const std::string& pass) {
             (!kr.empty() && kr.find_first_not_of("0123456789") == std::string::npos)
                 ? atol(kr.c_str())
                 : 60;
+        if (keepInterval_ <= 0) keepInterval_ = 60;  // 防守：服务端异常值会导致 sleep(0) 空转
     }
     dlog("keepUrl=" + keepUrl_ + " interval=" + std::to_string(keepInterval_));
     if (keepUrl_.empty()) return "认证响应异常（缺少 keep-url）";
@@ -366,6 +367,7 @@ Dialer::KeepOutcome Dialer::keepOnce() {
         std::string iv = regexFind1(plain, "<interval>", "</interval>");
         if (!iv.empty() && iv.find_first_not_of("0123456789") == std::string::npos)
             keepInterval_ = atol(iv.c_str());
+        if (keepInterval_ <= 0) keepInterval_ = 60;  // 防守：同上
         dlog("keep ok, next in " + std::to_string(keepInterval_) + "s");
         return {KeepOutcome::OK, "", "", ""};
     } catch (const EmuExit& e) {
@@ -398,11 +400,10 @@ bool Dialer::hasKeepSession() const {
     return session_ != nullptr && !keepUrl_.empty() && !ticket_.empty();
 }
 
-// Lightweight liveness probe between heartbeats (no crypto, 5s timeout):
-//  - CHECK_URL 302 with Location => BAS says unauthenticated (kicked/offline) => EARLY_KEEP
-//  - CHECK exception/timeout => link down => EARLY_KEEP
-//  - CHECK 200 (ONLINE) + generate_204 保底：204 成功 => OK；204 失败则每 3s 重试，
-//    中途成功即清零放行，连续 NET204_MAX_FAILS 次失败 => FORCE_RELOGIN（强制下线重登）
+// Liveness probe between heartbeats (no crypto, 5s timeout):
+// 以外网 generate_204 为兜底：204 不通（DNS 失败也算不通）则一律走
+// NET204_MAX_FAILS 次计数（每 3s 一次），全失败 => FORCE_RELOGIN（下线重登）。
+// 204 通才看 portal check：302 有 Location / check 异常 => EARLY_KEEP（提前心跳）。
 static bool net204Once() {
     try {
         HttpRequest n;
@@ -421,6 +422,8 @@ static bool net204Once() {
 }
 
 Dialer::ProbeResult Dialer::quickPortalProbe() {
+    // 1. portal check 只记录提示，不直接决定 FORCE_RELOGIN
+    bool portalHintEarly = false;
     try {
         HttpRequest r;
         r.url = checkUrl();
@@ -431,32 +434,41 @@ Dialer::ProbeResult Dialer::quickPortalProbe() {
         std::string loc = chk.header("Location");
         if (!loc.empty()) {
             dlog("probe: portal redirect reappeared -> " + loc.substr(0, 120));
-            return ProbeResult::EARLY_KEEP;
+            portalHintEarly = true;
         }
-        for (int i = 1; i <= NET204_MAX_FAILS && !gStop; i++) {
-            if (net204Once()) {
-                if (i > 1) dlog("204 probe recovered on attempt " + std::to_string(i));
-                return ProbeResult::OK;
-            }
-            if (i < NET204_MAX_FAILS) {
-                dlog("204 probe failed (" + std::to_string(i) + "/" +
-                     std::to_string(NET204_MAX_FAILS) + "), retry in " +
-                     std::to_string(NET204_RETRY_DELAY_SEC) + "s");
-                sleepInterruptible(NET204_RETRY_DELAY_SEC);
-                if (gStop) return ProbeResult::OK;  // shutting down: let caller exit
-            }
-        }
-        if (gStop) return ProbeResult::OK;
-        return ProbeResult::FORCE_RELOGIN;
     } catch (const std::exception& e) {
-        dlog(std::string("probe failed: ") + e.what());
-        return ProbeResult::EARLY_KEEP;
+        dlog(std::string("probe check failed (defer to 204): ") + e.what());
+        portalHintEarly = true;
     }
+    // 2. 204 兜底：5 次计数，中途成功即放行
+    for (int i = 1; i <= NET204_MAX_FAILS && !gStop; i++) {
+        if (net204Once()) {
+            if (i > 1) dlog("204 probe recovered on attempt " + std::to_string(i));
+            return portalHintEarly ? ProbeResult::EARLY_KEEP : ProbeResult::OK;
+        }
+        if (i < NET204_MAX_FAILS) {
+            dlog("204 probe failed (" + std::to_string(i) + "/" +
+                 std::to_string(NET204_MAX_FAILS) + "), retry in " +
+                 std::to_string(NET204_RETRY_DELAY_SEC) + "s");
+            sleepInterruptible(NET204_RETRY_DELAY_SEC);
+            if (gStop) return ProbeResult::OK;  // shutting down: let caller exit
+        }
+    }
+    if (gStop) return ProbeResult::OK;
+    return ProbeResult::FORCE_RELOGIN;
 }
 
 // sleep keepInterval in 5s slices; EARLY_KEEP = probe suggests an early heartbeat,
-// FORCE_RELOGIN = generate_204 保底连续失败，调用方直接下线重登
+// FORCE_RELOGIN = generate_204 保底连续失败，调用方直接下线重登.
+// 保证每轮至少探活一次：keepInterval_ <= 15s 时上面的取模条件永远不成立，
+// 因此小间隔直接走“睡满全程 + 一次完整 quickPortalProbe()（含 5 次 204）”。
 Dialer::ProbeResult Dialer::sleepWithProbe(long totalSec) {
+    if (totalSec <= 0) return ProbeResult::OK;
+    if (totalSec <= PROBE_EVERY_SEC) {
+        sleepInterruptible(totalSec);
+        if (gStop) return ProbeResult::OK;
+        return quickPortalProbe();
+    }
     long elapsed = 0;
     while (elapsed < totalSec && !gStop) {
         long step =
